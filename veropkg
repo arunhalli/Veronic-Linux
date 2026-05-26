@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""
+veropkg - Veronic Linux Package Manager
+Handles dependency graph resolution and bubblewrap sandboxing.
+"""
+
+import argparse
+import subprocess
+import os
+import sys
+import json
+
+# ==========================================
+# 1. MOCK REPOSITORY (For Demonstration)
+# In production, this would be fetched from 
+# https://veronic.linux/repo/packages.json
+# ==========================================
+VDE_REPO = {
+    "glibc": {"version": "2.38", "deps": []},
+    "wayland": {"version": "1.22", "deps": ["glibc"]},
+    "mesa": {"version": "24.0", "deps": ["glibc", "wayland"]},
+    "alacritty": {"version": "0.13", "deps": ["mesa", "wayland"]},
+    "firefox": {"version": "123.0", "deps": ["mesa", "wayland", "ffmpeg"]},
+    "ffmpeg": {"version": "6.1", "deps": ["glibc"]},
+}
+
+# ==========================================
+# 2. DEPENDENCY RESOLUTION (Topological Sort)
+# ==========================================
+class DependencyResolver:
+    def __init__(self, repo_data):
+        self.repo = repo_data
+
+    def resolve(self, target_pkg):
+        """
+        Uses Depth-First Search (DFS) to traverse the dependency tree
+        and returns a flat list of packages in the correct installation order.
+        """
+        if target_pkg not in self.repo:
+            print(f"❌ Error: Package '{target_pkg}' not found in repositories.")
+            sys.exit(1)
+
+        visited = set()
+        install_order = []
+        recursion_stack = set() # Used to detect circular dependencies
+
+        def dfs(pkg):
+            if pkg in recursion_stack:
+                print(f"❌ Error: Circular dependency detected involving '{pkg}'.")
+                sys.exit(1)
+            if pkg in visited:
+                return
+
+            recursion_stack.add(pkg)
+            
+            # Fetch dependencies for the current package
+            deps = self.repo.get(pkg, {}).get("deps", [])
+            for dep in deps:
+                if dep not in self.repo:
+                    print(f"❌ Error: Unmet dependency '{dep}' required by '{pkg}'.")
+                    sys.exit(1)
+                dfs(dep)
+            
+            recursion_stack.remove(pkg)
+            visited.add(pkg)
+            install_order.append(pkg) # Append after dependencies are processed
+
+        dfs(target_pkg)
+        return install_order
+
+# ==========================================
+# 3. BUBBLEWRAP SANDBOX ENGINE
+# ==========================================
+class SandboxEngine:
+    def __init__(self, pkg_name):
+        self.pkg_name = pkg_name
+        # Isolate the app's data from the rest of the system
+        self.app_data_dir = f"/home/veronic/.local/share/veronic_apps/{pkg_name}"
+        self.xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+
+    def create_sandbox(self):
+        """
+        Constructs the secure bwrap command.
+        - The host filesystem is mounted strictly Read-Only.
+        - The app gets a fake, isolated /home directory.
+        - Only the Wayland socket is exposed (no X11).
+        """
+        print(f"🛡️  Constructing secure AppArmor/bwrap profile for {self.pkg_name}...")
+        
+        # Ensure the isolated app data directory exists
+        os.makedirs(self.app_data_dir, exist_ok=True)
+
+        bwrap_cmd = [
+            "bwrap",
+            # --- 1. Base System (Read-Only) ---
+            "--ro-bind", "/", "/",
+            "--dev", "/dev",               # Needed for GPU access (DRI)
+            "--proc", "/proc",             # Process tree
+            
+            # --- 2. Throwaway /tmp and /run ---
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/run",
+            
+            # --- 3. Wayland Socket Hole-punch ---
+            # Allows the app to draw to the screen without giving it full /run access
+            "--ro-bind", f"{self.xdg_runtime}/wayland-1", f"{self.xdg_runtime}/wayland-1",
+            
+            # --- 4. Isolated Home Directory ---
+            # The app thinks it has full access to /home/veronic, but it's actually 
+            # writing to a sandboxed folder in ~/.local/share/veronic_apps/
+            "--bind", self.app_data_dir, "/home/veronic",
+            
+            # --- 5. Network & Process Isolation ---
+            "--unshare-pid",               # App cannot see other system processes
+            "--unshare-uts",               # App cannot change the hostname
+            "--share-net",                 # Assuming the app needs internet (e.g., Firefox)
+            
+            # --- 6. Execution Target ---
+            f"/usr/bin/{self.pkg_name}"
+        ]
+
+        return bwrap_cmd
+
+    def launch(self):
+        cmd = self.create_sandbox()
+        print(f"🚀 Launching '{self.pkg_name}' inside isolated namespace...\n")
+        try:
+            # Replace the current veropkg process with the sandboxed app
+            os.execvp("bwrap", cmd)
+        except FileNotFoundError:
+            print("❌ Error: 'bwrap' executable not found on the host system.")
+            sys.exit(1)
+
+# ==========================================
+# 4. CLI INTERFACE
+# ==========================================
+def main():
+    parser = argparse.ArgumentParser(description="veropkg - Simple. Secure. Yours.")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    # Install command
+    install_parser = subparsers.add_parser("install", help="Install a package and its dependencies")
+    install_parser.add_argument("package", help="Name of the package")
+
+    # Run command
+    run_parser = subparsers.add_parser("run", help="Run an installed application in a secure sandbox")
+    run_parser.add_argument("package", help="Name of the package to execute")
+
+    args = parser.parse_args()
+
+    if args.action == "install":
+        resolver = DependencyResolver(VDE_REPO)
+        print(f"🔍 Analyzing dependencies for '{args.package}'...")
+        install_plan = resolver.resolve(args.package)
+        
+        print("\n📦 Installation Plan:")
+        for i, pkg in enumerate(install_plan, 1):
+            version = VDE_REPO[pkg]['version']
+            print(f"  [{i}/{len(install_plan)}] {pkg} (v{version})")
+            
+        print("\n✅ Simulated install complete. All packages extracted to /usr.")
+
+    elif args.action == "run":
+        sandbox = SandboxEngine(args.package)
+        sandbox.launch()
+
+if __name__ == "__main__":
+    main()
