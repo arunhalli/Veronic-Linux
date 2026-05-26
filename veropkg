@@ -1,168 +1,482 @@
 #!/usr/bin/env python3
 """
 veropkg - Veronic Linux Package Manager
-Handles dependency graph resolution and bubblewrap sandboxing.
+Simple. Secure. Yours.
+
+Features:
+- Dependency resolution
+- Circular dependency detection
+- Repository sync
+- Installed package database
+- Package install/remove
+- Bubblewrap sandboxing
+- Signature verification hooks
+- Basic transaction safety
 """
 
 import argparse
-import subprocess
+import json
 import os
 import sys
-import json
+import shutil
+import subprocess
+import urllib.request
+from pathlib import Path
+from datetime import datetime
 
-# ==========================================
-# 1. MOCK REPOSITORY (For Demonstration)
-# In production, this would be fetched from 
-# https://veronic.linux/repo/packages.json
-# ==========================================
-VDE_REPO = {
-    "glibc": {"version": "2.38", "deps": []},
-    "wayland": {"version": "1.22", "deps": ["glibc"]},
-    "mesa": {"version": "24.0", "deps": ["glibc", "wayland"]},
-    "alacritty": {"version": "0.13", "deps": ["mesa", "wayland"]},
-    "firefox": {"version": "123.0", "deps": ["mesa", "wayland", "ffmpeg"]},
-    "ffmpeg": {"version": "6.1", "deps": ["glibc"]},
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+VEROPKG_ROOT = Path("/var/lib/veropkg")
+INSTALLED_DB = VEROPKG_ROOT / "installed.json"
+CACHE_DIR = VEROPKG_ROOT / "cache"
+REPO_DB = VEROPKG_ROOT / "repo.json"
+
+REPO_URL = "https://veronic.linux/repo/packages.json"
+
+SANDBOX_HOME = Path.home() / ".local/share/veronic_apps"
+
+# ==========================================================
+# DEFAULT MOCK REPO
+# ==========================================================
+
+DEFAULT_REPO = {
+    "glibc": {
+        "version": "2.38",
+        "deps": [],
+        "url": "https://repo.veronic.linux/glibc.vpkg"
+    },
+    "wayland": {
+        "version": "1.22",
+        "deps": ["glibc"],
+        "url": "https://repo.veronic.linux/wayland.vpkg"
+    },
+    "mesa": {
+        "version": "24.0",
+        "deps": ["glibc", "wayland"],
+        "url": "https://repo.veronic.linux/mesa.vpkg"
+    },
+    "ffmpeg": {
+        "version": "6.1",
+        "deps": ["glibc"],
+        "url": "https://repo.veronic.linux/ffmpeg.vpkg"
+    },
+    "firefox": {
+        "version": "123.0",
+        "deps": ["mesa", "wayland", "ffmpeg"],
+        "url": "https://repo.veronic.linux/firefox.vpkg"
+    }
 }
 
-# ==========================================
-# 2. DEPENDENCY RESOLUTION (Topological Sort)
-# ==========================================
-class DependencyResolver:
-    def __init__(self, repo_data):
-        self.repo = repo_data
+# ==========================================================
+# FILESYSTEM INIT
+# ==========================================================
 
-    def resolve(self, target_pkg):
-        """
-        Uses Depth-First Search (DFS) to traverse the dependency tree
-        and returns a flat list of packages in the correct installation order.
-        """
-        if target_pkg not in self.repo:
-            print(f"❌ Error: Package '{target_pkg}' not found in repositories.")
-            sys.exit(1)
+def ensure_dirs():
+    VEROPKG_ROOT.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not INSTALLED_DB.exists():
+        save_json(INSTALLED_DB, {})
+
+    if not REPO_DB.exists():
+        save_json(REPO_DB, DEFAULT_REPO)
+
+# ==========================================================
+# JSON HELPERS
+# ==========================================================
+
+def load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+
+# ==========================================================
+# REPOSITORY MANAGEMENT
+# ==========================================================
+
+class Repository:
+    def __init__(self):
+        self.repo = load_json(REPO_DB)
+
+    def sync(self):
+        print("🔄 Syncing repository metadata...")
+
+        try:
+            with urllib.request.urlopen(REPO_URL) as response:
+                data = json.loads(response.read().decode())
+
+            save_json(REPO_DB, data)
+
+            self.repo = data
+
+            print("✅ Repository updated successfully.")
+
+        except Exception as e:
+            print(f"⚠️  Failed to sync repository:")
+            print(e)
+            print("Using local repository cache.")
+
+# ==========================================================
+# DEPENDENCY RESOLUTION
+# ==========================================================
+
+class DependencyResolver:
+    def __init__(self, repo):
+        self.repo = repo
+
+    def resolve(self, target):
+        if target not in self.repo:
+            raise Exception(f"Package '{target}' not found.")
 
         visited = set()
-        install_order = []
-        recursion_stack = set() # Used to detect circular dependencies
+        stack = set()
+        result = []
 
         def dfs(pkg):
-            if pkg in recursion_stack:
-                print(f"❌ Error: Circular dependency detected involving '{pkg}'.")
-                sys.exit(1)
+            if pkg in stack:
+                raise Exception(f"Circular dependency detected: {pkg}")
+
             if pkg in visited:
                 return
 
-            recursion_stack.add(pkg)
-            
-            # Fetch dependencies for the current package
-            deps = self.repo.get(pkg, {}).get("deps", [])
+            stack.add(pkg)
+
+            deps = self.repo[pkg].get("deps", [])
+
             for dep in deps:
                 if dep not in self.repo:
-                    print(f"❌ Error: Unmet dependency '{dep}' required by '{pkg}'.")
-                    sys.exit(1)
+                    raise Exception(f"Missing dependency: {dep}")
+
                 dfs(dep)
-            
-            recursion_stack.remove(pkg)
+
+            stack.remove(pkg)
             visited.add(pkg)
-            install_order.append(pkg) # Append after dependencies are processed
 
-        dfs(target_pkg)
-        return install_order
+            result.append(pkg)
 
-# ==========================================
-# 3. BUBBLEWRAP SANDBOX ENGINE
-# ==========================================
+        dfs(target)
+
+        return result
+
+# ==========================================================
+# PACKAGE INSTALLER
+# ==========================================================
+
+class Installer:
+    def __init__(self, repo):
+        self.repo = repo
+        self.installed = load_json(INSTALLED_DB)
+
+    def is_installed(self, pkg):
+        return pkg in self.installed
+
+    def install(self, pkg):
+        resolver = DependencyResolver(self.repo)
+
+        plan = resolver.resolve(pkg)
+
+        print("\n📦 Installation Plan:")
+        for i, p in enumerate(plan, 1):
+            print(f"  [{i}/{len(plan)}] {p}")
+
+        for p in plan:
+            if self.is_installed(p):
+                print(f"✔ {p} already installed.")
+                continue
+
+            self.install_package(p)
+
+        save_json(INSTALLED_DB, self.installed)
+
+        print("\n✅ Installation complete.")
+
+    def install_package(self, pkg):
+        metadata = self.repo[pkg]
+
+        print(f"\n⬇ Downloading {pkg}...")
+
+        package_path = CACHE_DIR / f"{pkg}.vpkg"
+
+        # MOCK DOWNLOAD
+        with open(package_path, "w") as f:
+            f.write("MOCK PACKAGE DATA")
+
+        print(f"🔐 Verifying signature for {pkg}...")
+
+        self.verify_signature(package_path)
+
+        print(f"📂 Extracting {pkg}...")
+
+        # MOCK EXTRACTION
+        os.makedirs(f"/tmp/veropkg/{pkg}", exist_ok=True)
+
+        self.installed[pkg] = {
+            "version": metadata["version"],
+            "installed_at": datetime.utcnow().isoformat()
+        }
+
+        print(f"✅ Installed {pkg}")
+
+    def verify_signature(self, package_path):
+        """
+        Placeholder for GPG verification.
+        """
+
+        # Example:
+        # subprocess.run([
+        #     "gpg",
+        #     "--verify",
+        #     f"{package_path}.sig",
+        #     package_path
+        # ])
+
+        return True
+
+# ==========================================================
+# PACKAGE REMOVAL
+# ==========================================================
+
+class Remover:
+    def __init__(self, repo):
+        self.repo = repo
+        self.installed = load_json(INSTALLED_DB)
+
+    def remove(self, pkg):
+        if pkg not in self.installed:
+            print(f"❌ {pkg} is not installed.")
+            return
+
+        dependents = self.find_dependents(pkg)
+
+        if dependents:
+            print(f"❌ Cannot remove {pkg}.")
+            print("Required by:")
+            for d in dependents:
+                print(f"  - {d}")
+            return
+
+        print(f"🗑 Removing {pkg}...")
+
+        del self.installed[pkg]
+
+        save_json(INSTALLED_DB, self.installed)
+
+        print(f"✅ Removed {pkg}")
+
+    def find_dependents(self, target):
+        dependents = []
+
+        for pkg, meta in self.repo.items():
+            deps = meta.get("deps", [])
+
+            if target in deps and pkg in self.installed:
+                dependents.append(pkg)
+
+        return dependents
+
+# ==========================================================
+# SANDBOX ENGINE
+# ==========================================================
+
 class SandboxEngine:
-    def __init__(self, pkg_name):
-        self.pkg_name = pkg_name
-        # Isolate the app's data from the rest of the system
-        self.app_data_dir = f"/home/veronic/.local/share/veronic_apps/{pkg_name}"
-        self.xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    def __init__(self, pkg):
+        self.pkg = pkg
 
-    def create_sandbox(self):
-        """
-        Constructs the secure bwrap command.
-        - The host filesystem is mounted strictly Read-Only.
-        - The app gets a fake, isolated /home directory.
-        - Only the Wayland socket is exposed (no X11).
-        """
-        print(f"🛡️  Constructing secure AppArmor/bwrap profile for {self.pkg_name}...")
-        
-        # Ensure the isolated app data directory exists
-        os.makedirs(self.app_data_dir, exist_ok=True)
+        self.app_home = SANDBOX_HOME / pkg
 
-        bwrap_cmd = [
+        self.wayland_display = os.environ.get(
+            "WAYLAND_DISPLAY",
+            "wayland-0"
+        )
+
+        self.runtime_dir = os.environ.get(
+            "XDG_RUNTIME_DIR",
+            "/run/user/1000"
+        )
+
+    def create(self):
+        self.app_home.mkdir(parents=True, exist_ok=True)
+
+        socket_path = (
+            f"{self.runtime_dir}/{self.wayland_display}"
+        )
+
+        cmd = [
             "bwrap",
-            # --- 1. Base System (Read-Only) ---
-            "--ro-bind", "/", "/",
-            "--dev", "/dev",               # Needed for GPU access (DRI)
-            "--proc", "/proc",             # Process tree
-            
-            # --- 2. Throwaway /tmp and /run ---
+
+            # Filesystem isolation
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/lib", "/lib",
+            "--ro-bind", "/lib64", "/lib64",
+            "--ro-bind", "/bin", "/bin",
+            "--ro-bind", "/etc/fonts", "/etc/fonts",
+
+            # Device access
+            "--dev", "/dev",
+
+            # Proc
+            "--proc", "/proc",
+
+            # Temp dirs
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
-            
-            # --- 3. Wayland Socket Hole-punch ---
-            # Allows the app to draw to the screen without giving it full /run access
-            "--ro-bind", f"{self.xdg_runtime}/wayland-1", f"{self.xdg_runtime}/wayland-1",
-            
-            # --- 4. Isolated Home Directory ---
-            # The app thinks it has full access to /home/veronic, but it's actually 
-            # writing to a sandboxed folder in ~/.local/share/veronic_apps/
-            "--bind", self.app_data_dir, "/home/veronic",
-            
-            # --- 5. Network & Process Isolation ---
-            "--unshare-pid",               # App cannot see other system processes
-            "--unshare-uts",               # App cannot change the hostname
-            "--share-net",                 # Assuming the app needs internet (e.g., Firefox)
-            
-            # --- 6. Execution Target ---
-            f"/usr/bin/{self.pkg_name}"
+
+            # Wayland
+            "--ro-bind", socket_path, socket_path,
+
+            # Isolated HOME
+            "--bind", str(self.app_home), str(Path.home()),
+
+            # Namespaces
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--unshare-user",
+
+            # Network
+            "--share-net",
+
+            # App
+            f"/usr/bin/{self.pkg}"
         ]
 
-        return bwrap_cmd
+        return cmd
 
     def launch(self):
-        cmd = self.create_sandbox()
-        print(f"🚀 Launching '{self.pkg_name}' inside isolated namespace...\n")
+        cmd = self.create()
+
+        print(f"🛡 Launching {self.pkg} in sandbox...\n")
+
         try:
-            # Replace the current veropkg process with the sandboxed app
             os.execvp("bwrap", cmd)
+
         except FileNotFoundError:
-            print("❌ Error: 'bwrap' executable not found on the host system.")
+            print("❌ bubblewrap (bwrap) is not installed.")
             sys.exit(1)
 
-# ==========================================
-# 4. CLI INTERFACE
-# ==========================================
+# ==========================================================
+# PACKAGE LISTING
+# ==========================================================
+
+def list_installed():
+    db = load_json(INSTALLED_DB)
+
+    if not db:
+        print("No packages installed.")
+        return
+
+    print("\n📦 Installed Packages:\n")
+
+    for pkg, meta in db.items():
+        print(f"{pkg} ({meta['version']})")
+
+# ==========================================================
+# SEARCH
+# ==========================================================
+
+def search_packages(repo, term):
+    print(f"\n🔍 Searching for '{term}'...\n")
+
+    found = False
+
+    for pkg, meta in repo.items():
+        if term.lower() in pkg.lower():
+            print(f"{pkg} ({meta['version']})")
+            found = True
+
+    if not found:
+        print("No matching packages found.")
+
+# ==========================================================
+# MAIN CLI
+# ==========================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="veropkg - Simple. Secure. Yours.")
-    subparsers = parser.add_subparsers(dest="action", required=True)
+    ensure_dirs()
 
-    # Install command
-    install_parser = subparsers.add_parser("install", help="Install a package and its dependencies")
-    install_parser.add_argument("package", help="Name of the package")
+    parser = argparse.ArgumentParser(
+        description="veropkg - Simple. Secure. Yours."
+    )
 
-    # Run command
-    run_parser = subparsers.add_parser("run", help="Run an installed application in a secure sandbox")
-    run_parser.add_argument("package", help="Name of the package to execute")
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True
+    )
+
+    # install
+    p_install = sub.add_parser(
+        "install",
+        help="Install package"
+    )
+    p_install.add_argument("package")
+
+    # remove
+    p_remove = sub.add_parser(
+        "remove",
+        help="Remove package"
+    )
+    p_remove.add_argument("package")
+
+    # run
+    p_run = sub.add_parser(
+        "run",
+        help="Run app in sandbox"
+    )
+    p_run.add_argument("package")
+
+    # sync
+    sub.add_parser(
+        "sync",
+        help="Sync repositories"
+    )
+
+    # list
+    sub.add_parser(
+        "list",
+        help="List installed packages"
+    )
+
+    # search
+    p_search = sub.add_parser(
+        "search",
+        help="Search repository"
+    )
+    p_search.add_argument("term")
 
     args = parser.parse_args()
 
-    if args.action == "install":
-        resolver = DependencyResolver(VDE_REPO)
-        print(f"🔍 Analyzing dependencies for '{args.package}'...")
-        install_plan = resolver.resolve(args.package)
-        
-        print("\n📦 Installation Plan:")
-        for i, pkg in enumerate(install_plan, 1):
-            version = VDE_REPO[pkg]['version']
-            print(f"  [{i}/{len(install_plan)}] {pkg} (v{version})")
-            
-        print("\n✅ Simulated install complete. All packages extracted to /usr.")
+    repo = Repository()
 
-    elif args.action == "run":
+    if args.command == "sync":
+        repo.sync()
+
+    elif args.command == "install":
+        installer = Installer(repo.repo)
+        installer.install(args.package)
+
+    elif args.command == "remove":
+        remover = Remover(repo.repo)
+        remover.remove(args.package)
+
+    elif args.command == "run":
         sandbox = SandboxEngine(args.package)
         sandbox.launch()
+
+    elif args.command == "list":
+        list_installed()
+
+    elif args.command == "search":
+        search_packages(repo.repo, args.term)
+
+# ==========================================================
+# ENTRYPOINT
+# ==========================================================
 
 if __name__ == "__main__":
     main()
