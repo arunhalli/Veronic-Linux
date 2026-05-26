@@ -94,10 +94,20 @@ We welcome contributions of all sizes! Please read [CONTRIBUTING.md](CONTRIBUTIN
 
 ---
 
+## 🤝 Contributing
+We welcome contributions of all sizes! Please read CONTRIBUTING.md before opening a pull request.
+
+Bug reports → GitHub Issues
+
+Security vulnerabilities → security@veronic.linux (do not open a public issue)
+
 ## 📜 License
+Veronic is licensed under the GNU General Public License Version 3. See LICENSE for details.
 
-Veronic is licensed under the **GNU General Public License v2.0**. See [LICENSE](LICENSE) for details.
+Next Step for the License
+Since you are pointing users to a LICENSE file, make sure to actually create that file in the root of your repository.
 
----
+You can get the official plain-text version of the GPLv3 directly from the GNU website. In your terminal, run this inside your repository folder to download it automatically:
 
-<p align="center">Made with ❤️ by the Veronic community</p>
+Bash
+curl -o LICENSE https://www.gnu.org/licenses/gpl-3.0.txt
