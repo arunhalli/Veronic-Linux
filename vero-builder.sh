@@ -1,38 +1,256 @@
+```bash
 #!/usr/bin/env bash
-# vero-builder.sh - Bootstrap script for Veronic Linux
+# =========================================================
+# Veronic Linux Builder
+# Minimal Linux Distribution Bootstrap Script
+# =========================================================
 
-set -e
-V_ROOT="/tmp/veronic-build"
-V_ISO="veronic-latest.iso"
+set -euo pipefail
 
-echo "🐧 Starting Veronic Linux Build Process..."
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
 
-# 1. Create directory structure
-echo "=> Creating root filesystem in $V_ROOT..."
-mkdir -p $V_ROOT/{bin,boot,dev,etc,home,lib,mnt,opt,proc,root,run,sbin,sys,tmp,usr,var,vero}
-mkdir -p $V_ROOT/usr/{bin,lib,sbin,share}
+VERO_NAME="Veronic Linux"
+VERO_VERSION="Rolling"
+VERO_ROOT="/tmp/veronic-build"
+VERO_ISO="veronic-latest.iso"
+BUSYBOX_VERSION="1.35.0"
+ARCH="$(uname -m)"
 
-# 2. Bootstrap base system (Conceptual: pulling statically compiled coreutils/busybox)
-echo "=> Fetching core system utilities..."
-wget -qO $V_ROOT/bin/busybox https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
-chmod +x $V_ROOT/bin/busybox
-for cmd in sh ls cp mv rm cat mdir mount ip init; do
-    ln -s /bin/busybox $V_ROOT/bin/$cmd
+# ---------------------------------------------------------
+# Banner
+# ---------------------------------------------------------
+
+echo "======================================"
+echo "   Veronic Linux Build System"
+echo "======================================"
+
+# ---------------------------------------------------------
+# Dependency Check
+# ---------------------------------------------------------
+
+check_dependency() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "ERROR: Missing dependency: $1"
+        exit 1
+    }
+}
+
+echo "[*] Checking host dependencies..."
+
+for pkg in wget chmod ln mkdir cat uname; do
+    check_dependency "$pkg"
 done
 
-# 3. Setup basic configuration
-echo "=> Writing default configurations..."
-echo "Veronic Linux" > $V_ROOT/etc/hostname
-cat << 'EOF' > $V_ROOT/etc/os-release
-NAME="Veronic Linux"
-PRETTY_NAME="Veronic Linux (Rolling)"
+echo "[✓] Dependencies OK"
+
+# ---------------------------------------------------------
+# Cleanup Previous Build
+# ---------------------------------------------------------
+
+echo "[*] Cleaning previous build directory..."
+
+rm -rf "$VERO_ROOT"
+mkdir -p "$VERO_ROOT"
+
+# ---------------------------------------------------------
+# Create Root Filesystem
+# ---------------------------------------------------------
+
+echo "[*] Creating filesystem structure..."
+
+mkdir -p "$VERO_ROOT"/{
+bin,
+boot,
+dev,
+etc,
+home,
+lib,
+lib64,
+media,
+mnt,
+opt,
+proc,
+root,
+run,
+sbin,
+srv,
+sys,
+tmp,
+usr,
+var,
+vero
+}
+
+mkdir -p "$VERO_ROOT/usr"/{
+bin,
+lib,
+sbin,
+share
+}
+
+mkdir -p "$VERO_ROOT/var"/{
+log,
+cache,
+tmp
+}
+
+chmod 1777 "$VERO_ROOT/tmp"
+
+echo "[✓] Filesystem structure created"
+
+# ---------------------------------------------------------
+# Download BusyBox
+# ---------------------------------------------------------
+
+echo "[*] Downloading BusyBox..."
+
+BUSYBOX_URL="https://busybox.net/downloads/binaries/${BUSYBOX_VERSION}-x86_64-linux-musl/busybox"
+
+wget -qO "$VERO_ROOT/bin/busybox" "$BUSYBOX_URL"
+
+chmod +x "$VERO_ROOT/bin/busybox"
+
+echo "[✓] BusyBox installed"
+
+# ---------------------------------------------------------
+# Create Core Utility Symlinks
+# ---------------------------------------------------------
+
+echo "[*] Creating BusyBox symlinks..."
+
+CORE_CMDS=(
+sh
+ash
+ls
+cp
+mv
+rm
+cat
+echo
+mkdir
+mount
+umount
+dmesg
+ps
+top
+ip
+ping
+init
+reboot
+poweroff
+)
+
+for cmd in "${CORE_CMDS[@]}"; do
+    ln -sf /bin/busybox "$VERO_ROOT/bin/$cmd"
+done
+
+echo "[✓] Core commands linked"
+
+# ---------------------------------------------------------
+# System Configuration
+# ---------------------------------------------------------
+
+echo "[*] Writing system configuration..."
+
+echo "veronic" > "$VERO_ROOT/etc/hostname"
+
+cat > "$VERO_ROOT/etc/os-release" << EOF
+NAME="${VERO_NAME}"
+PRETTY_NAME="${VERO_NAME} (${VERO_VERSION})"
 ID=veronic
+VERSION="${VERO_VERSION}"
 HOME_URL="https://veronic.linux/"
+SUPPORT_URL="https://veronic.linux/support"
+BUG_REPORT_URL="https://veronic.linux/issues"
 EOF
 
-# 4. Generate Initramfs and ISO (Requires syslinux/grub and xorriso in your host OS)
-echo "=> Building bootable ISO (mockup)..."
-# In a real environment, you would use xorriso to pack $V_ROOT and the Linux kernel into an ISO.
-# xorriso -as mkisofs -o $V_ISO -R -J -c boot/boot.cat -b boot/syslinux/isolinux.bin ... $V_ROOT
+# ---------------------------------------------------------
+# fstab
+# ---------------------------------------------------------
 
-echo "✨ Build complete! (Conceptual) -> $V_ISO"
+cat > "$VERO_ROOT/etc/fstab" << EOF
+proc    /proc   proc    defaults    0 0
+sysfs   /sys    sysfs   defaults    0 0
+tmpfs   /tmp    tmpfs   defaults    0 0
+EOF
+
+# ---------------------------------------------------------
+# Minimal Init Script
+# ---------------------------------------------------------
+
+echo "[*] Creating init system..."
+
+cat > "$VERO_ROOT/init" << 'EOF'
+#!/bin/sh
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo ""
+echo "================================"
+echo " Welcome to Veronic Linux"
+echo "================================"
+echo ""
+
+exec /bin/sh
+EOF
+
+chmod +x "$VERO_ROOT/init"
+
+echo "[✓] Init script created"
+
+# ---------------------------------------------------------
+# Placeholder Kernel
+# ---------------------------------------------------------
+
+echo "[*] Kernel step..."
+
+mkdir -p "$VERO_ROOT/boot"
+
+echo "NOTE:"
+echo "A real Linux kernel must be copied into:"
+echo "$VERO_ROOT/boot/vmlinuz"
+
+# ---------------------------------------------------------
+# ISO Build Stage
+# ---------------------------------------------------------
+
+echo "[*] Preparing ISO build..."
+
+cat << EOF
+
+To build a real ISO image, install:
+
+  - xorriso
+  - grub
+  - syslinux
+
+Example:
+
+xorriso -as mkisofs \\
+  -o ${VERO_ISO} \\
+  -R -J \\
+  -V "VERONIC" \\
+  ${VERO_ROOT}
+
+EOF
+
+# ---------------------------------------------------------
+# Finish
+# ---------------------------------------------------------
+
+echo ""
+echo "======================================"
+echo " Veronic Linux bootstrap complete"
+echo "======================================"
+echo ""
+echo "Root filesystem:"
+echo "  ${VERO_ROOT}"
+echo ""
+echo "Target ISO:"
+echo "  ${VERO_ISO}"
+echo ""
+```
