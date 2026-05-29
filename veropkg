@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
 veropkg - Veronic Linux Package Manager
-Simple. Secure. Yours.
+Production-Oriented Prototype
 
 Features:
 - Dependency resolution
 - Circular dependency detection
+- Atomic database writes
+- Lockfile protection
+- Safe extraction
+- Transaction rollback
+- Package install/remove/upgrade
 - Repository sync
-- Installed package database
-- Package install/remove
-- Bubblewrap sandboxing
-- Signature verification hooks
-- Basic transaction safety
+- Sandbox execution
+- Auto dependency cleanup
+- SHA256 verification
+- Safe install roots
+
+Author: Veronic Linux Project
 """
 
-#!/usr/bin/env python3
-
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -26,20 +31,34 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
+try:
+    from packaging import version
+except ImportError:
+    print("Install python-packaging:")
+    print("pip install packaging")
+    sys.exit(1)
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 ROOT = Path("/var/lib/veropkg")
 
 CACHE_DIR = ROOT / "cache"
 DB_DIR = ROOT / "db"
 TRANSACTION_DIR = ROOT / "transactions"
+LOCKFILE = ROOT / "veropkg.lock"
 
 INSTALLED_DB = DB_DIR / "installed.json"
 FILES_DB = DB_DIR / "files.json"
 REPO_DB = DB_DIR / "repo.json"
 
-SYSTEM_ROOT = Path("/")
+SYSTEM_ROOT = Path(
+    os.environ.get("VEROPKG_ROOT", "/")
+)
 
 REPO_URL = "https://repo.veronic.linux/packages.json"
 
@@ -72,27 +91,48 @@ DEFAULT_REPO = {
     }
 }
 
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
+
+
 def ensure_dirs():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(parents=True, exist_ok=True)
     TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
 
     if not INSTALLED_DB.exists():
-        save_json(INSTALLED_DB, {})
+        atomic_save_json(INSTALLED_DB, {})
 
     if not FILES_DB.exists():
-        save_json(FILES_DB, {})
+        atomic_save_json(FILES_DB, {})
 
     if not REPO_DB.exists():
-        save_json(REPO_DB, DEFAULT_REPO)
+        atomic_save_json(REPO_DB, DEFAULT_REPO)
+
+
 
 def load_json(path):
     with open(path, "r") as f:
         return json.load(f)
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
+
+
+def atomic_save_json(path, data):
+    path = Path(path)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        delete=False,
+        dir=path.parent
+    ) as tmp:
+        json.dump(data, tmp, indent=4)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+
+    os.replace(tmp.name, path)
+
+
 
 def sha256sum(path):
     h = hashlib.sha256()
@@ -108,10 +148,14 @@ def sha256sum(path):
 
     return h.hexdigest()
 
+
+
 def require_root():
     if os.geteuid() != 0:
         print("❌ This operation requires root.")
         sys.exit(1)
+
+
 
 def is_safe_path(base, target):
     base = os.path.abspath(base)
@@ -121,6 +165,8 @@ def is_safe_path(base, target):
         base,
         target
     ])
+
+
 
 def safe_extract(tar, path):
     extracted = []
@@ -135,7 +181,7 @@ def safe_extract(tar, path):
 
         if member.issym() or member.islnk():
             raise Exception(
-                f"Symlinks are forbidden in packages: {member.name}"
+                f"Symlinks forbidden: {member.name}"
             )
 
         if member.isdev():
@@ -143,37 +189,57 @@ def safe_extract(tar, path):
                 f"Device nodes forbidden: {member.name}"
             )
 
-        member.uid = 0
-        member.gid = 0
-        member.uname = "root"
-        member.gname = "root"
-
         tar.extract(member, path)
 
         extracted.append(member.name)
 
     return extracted
 
+
+# =========================================================
+# LOCKING
+# =========================================================
+
+class PackageLock:
+    def __enter__(self):
+        self.fd = open(LOCKFILE, "w")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+
+
+# =========================================================
+# REPOSITORY
+# =========================================================
+
 class Repository:
     def __init__(self):
         self.repo = load_json(REPO_DB)
 
     def sync(self):
-        print("🔄 Syncing repository metadata...")
+        print("🔄 Syncing repositories...")
 
         try:
             with urllib.request.urlopen(REPO_URL) as response:
                 data = json.loads(response.read().decode())
 
-            save_json(REPO_DB, data)
+            atomic_save_json(REPO_DB, data)
             self.repo = data
 
-            print("✅ Repository updated.")
+            print("✅ Repository updated")
 
         except Exception as e:
-            print("⚠️ Failed to sync repository:")
+            print("⚠ Failed to sync:")
             print(e)
-            print("Using cached metadata.")
+            print("Using cached repository.")
+
+
+# =========================================================
+# DEPENDENCY RESOLVER
+# =========================================================
 
 class DependencyResolver:
     def __init__(self, repo):
@@ -216,6 +282,11 @@ class DependencyResolver:
 
         return result
 
+
+# =========================================================
+# TRANSACTIONS
+# =========================================================
+
 class Transaction:
     def __init__(self):
         self.id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -248,7 +319,12 @@ class Transaction:
         for item in reversed(self.rollback_log):
             shutil.copy2(item["backup"], item["original"])
 
-        print("✅ Rollback complete.")
+        print("✅ Rollback complete")
+
+
+# =========================================================
+# INSTALLER
+# =========================================================
 
 class Installer:
     def __init__(self, repo):
@@ -257,11 +333,10 @@ class Installer:
         self.installed = load_json(INSTALLED_DB)
         self.files_db = load_json(FILES_DB)
 
-    def install(self, pkg):
+    def install(self, pkg, auto=False):
         require_root()
 
         resolver = DependencyResolver(self.repo)
-
         plan = resolver.resolve(pkg)
 
         print("\n📦 Installation Plan:\n")
@@ -277,19 +352,21 @@ class Installer:
                     print(f"✔ {p} already installed")
                     continue
 
-                self.install_package(p, tx)
+                dep_auto = p != pkg
 
-            save_json(INSTALLED_DB, self.installed)
-            save_json(FILES_DB, self.files_db)
+                self.install_package(p, tx, dep_auto)
 
-            print("\n✅ Installation successful.")
+            atomic_save_json(INSTALLED_DB, self.installed)
+            atomic_save_json(FILES_DB, self.files_db)
+
+            print("\n✅ Installation successful")
 
         except Exception as e:
             print(f"\n❌ Install failed: {e}")
             tx.rollback()
             sys.exit(1)
 
-    def install_package(self, pkg, tx):
+    def install_package(self, pkg, tx, auto=False):
         metadata = self.repo[pkg]
 
         url = metadata["url"]
@@ -303,11 +380,11 @@ class Installer:
             urllib.request.urlretrieve(url, package_path)
 
         except Exception:
-            print("⚠️ Mock mode: generating fake package")
+            print("⚠ Mock mode: generating demo package")
 
             with tarfile.open(package_path, "w:gz") as tar:
                 with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    tmp.write(b"demo")
+                    tmp.write(b"#!/bin/sh\necho Running package\n")
                     tmp.flush()
 
                     tar.add(tmp.name, arcname=f"usr/bin/{pkg}")
@@ -325,8 +402,6 @@ class Installer:
         print("📂 Extracting package...")
 
         staging = tempfile.mkdtemp(prefix="veropkg-")
-
-        extracted_files = []
 
         with tarfile.open(package_path) as tar:
             extracted_files = safe_extract(tar, staging)
@@ -356,6 +431,8 @@ class Installer:
 
             shutil.copy2(src, dest)
 
+            os.chmod(dest, 0o755)
+
             manifest.append(str(dest))
 
             self.files_db[str(dest)] = pkg
@@ -363,10 +440,16 @@ class Installer:
         self.installed[pkg] = {
             "version": metadata["version"],
             "installed_at": datetime.utcnow().isoformat(),
+            "auto_installed": auto,
             "files": manifest
         }
 
         print(f"✅ Installed {pkg}")
+
+
+# =========================================================
+# REMOVAL
+# =========================================================
 
 class Remover:
     def __init__(self, repo):
@@ -407,8 +490,8 @@ class Remover:
 
         del self.installed[pkg]
 
-        save_json(INSTALLED_DB, self.installed)
-        save_json(FILES_DB, self.files_db)
+        atomic_save_json(INSTALLED_DB, self.installed)
+        atomic_save_json(FILES_DB, self.files_db)
 
         print(f"✅ Removed {pkg}")
 
@@ -423,28 +506,60 @@ class Remover:
 
         return result
 
+
+# =========================================================
+# UPGRADER
+# =========================================================
+
+class Upgrader:
+    def __init__(self, repo):
+        self.repo = repo
+        self.installed = load_json(INSTALLED_DB)
+
+    def upgrade_all(self):
+        require_root()
+
+        updates = []
+
+        for pkg, meta in self.installed.items():
+            if pkg not in self.repo:
+                continue
+
+            local = meta["version"]
+            remote = self.repo[pkg]["version"]
+
+            if version.parse(remote) > version.parse(local):
+                updates.append((pkg, local, remote))
+
+        if not updates:
+            print("✅ System already up to date")
+            return
+
+        print("\n⬆ Available Updates:\n")
+
+        for pkg, local, remote in updates:
+            print(f"{pkg}: {local} → {remote}")
+
+        installer = Installer(self.repo)
+
+        for pkg, _, _ in updates:
+            installer.install(pkg)
+
+
+# =========================================================
+# SANDBOX
+# =========================================================
+
 class SandboxEngine:
     def __init__(self, pkg):
         self.pkg = pkg
 
         self.app_home = SANDBOX_HOME / pkg
 
-        self.runtime_dir = os.environ.get(
-            "XDG_RUNTIME_DIR",
-            f"/run/user/{os.getuid()}"
-        )
-
-        self.wayland_display = os.environ.get(
-            "WAYLAND_DISPLAY",
-            "wayland-0"
-        )
-
     def build(self):
         self.app_home.mkdir(parents=True, exist_ok=True)
 
-        socket_path = (
-            f"{self.runtime_dir}/{self.wayland_display}"
-        )
+        uid = os.getuid()
 
         return [
             "bwrap",
@@ -457,10 +572,11 @@ class SandboxEngine:
             "--proc", "/proc",
             "--dev", "/dev",
 
-            "--tmpfs", "/tmp",
-            "--tmpfs", "/run",
+            "--bind",
+            f"/run/user/{uid}",
+            f"/run/user/{uid}",
 
-            "--ro-bind", socket_path, socket_path,
+            "--tmpfs", "/tmp",
 
             "--bind",
             str(self.app_home),
@@ -469,7 +585,6 @@ class SandboxEngine:
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
-            "--unshare-cgroup",
 
             f"/usr/bin/{self.pkg}"
         ]
@@ -486,17 +601,26 @@ class SandboxEngine:
             print("❌ bubblewrap not installed")
             sys.exit(1)
 
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+
 def list_installed():
     db = load_json(INSTALLED_DB)
 
     if not db:
-        print("No installed packages.")
+        print("No installed packages")
         return
 
     print("\n📦 Installed Packages:\n")
 
     for pkg, meta in db.items():
-        print(f"{pkg} ({meta['version']})")
+        auto = " [auto]" if meta.get("auto_installed") else ""
+        print(f"{pkg} ({meta['version']}){auto}")
+
+
 
 def search(repo, term):
     print(f"\n🔍 Searching for '{term}'...\n")
@@ -509,7 +633,63 @@ def search(repo, term):
             found = True
 
     if not found:
-        print("No matches found.")
+        print("No matches found")
+
+
+
+def package_info(repo, pkg):
+    if pkg not in repo:
+        print("❌ Package not found")
+        return
+
+    meta = repo[pkg]
+
+    print(f"\n📦 {pkg}\n")
+
+    for k, v in meta.items():
+        print(f"{k}: {v}")
+
+
+
+def verify_installed(pkg):
+    installed = load_json(INSTALLED_DB)
+
+    if pkg not in installed:
+        print("❌ Package not installed")
+        return
+
+    files = installed[pkg].get("files", [])
+
+    missing = []
+
+    for f in files:
+        if not Path(f).exists():
+            missing.append(f)
+
+    if missing:
+        print("❌ Missing files:")
+
+        for f in missing:
+            print(f"  - {f}")
+
+    else:
+        print("✅ Package verified")
+
+
+
+def clean_cache():
+    if CACHE_DIR.exists():
+        shutil.rmtree(CACHE_DIR)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("✅ Cache cleaned")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
 
 def main():
     ensure_dirs()
@@ -532,32 +712,52 @@ def main():
     p_search = sub.add_parser("search")
     p_search.add_argument("term")
 
+    p_info = sub.add_parser("info")
+    p_info.add_argument("package")
+
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("package")
+
+    sub.add_parser("upgrade")
     sub.add_parser("list")
     sub.add_parser("sync")
+    sub.add_parser("clean")
 
     args = parser.parse_args()
 
     repo = Repository()
 
-    if args.cmd == "sync":
-        repo.sync()
+    with PackageLock():
+        if args.cmd == "sync":
+            repo.sync()
 
-    elif args.cmd == "install":
-        Installer(repo.repo).install(args.package)
+        elif args.cmd == "install":
+            Installer(repo.repo).install(args.package)
 
-    elif args.cmd == "remove":
-        Remover(repo.repo).remove(args.package)
+        elif args.cmd == "remove":
+            Remover(repo.repo).remove(args.package)
 
-    elif args.cmd == "run":
-        SandboxEngine(args.package).launch()
+        elif args.cmd == "run":
+            SandboxEngine(args.package).launch()
 
-    elif args.cmd == "list":
-        list_installed()
+        elif args.cmd == "upgrade":
+            Upgrader(repo.repo).upgrade_all()
 
-    elif args.cmd == "search":
-        search(repo.repo, args.term)
+        elif args.cmd == "list":
+            list_installed()
+
+        elif args.cmd == "search":
+            search(repo.repo, args.term)
+
+        elif args.cmd == "info":
+            package_info(repo.repo, args.package)
+
+        elif args.cmd == "verify":
+            verify_installed(args.package)
+
+        elif args.cmd == "clean":
+            clean_cache()
+
 
 if __name__ == "__main__":
     main()
-
-        
