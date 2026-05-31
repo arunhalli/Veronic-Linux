@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 veropkg - Veronic Linux Package Manager
-Version 0.2.0
+Version 0.2.2
 
 Improvements over v0.1:
   - Input validation on all package names (path traversal / injection blocked)
@@ -12,16 +12,15 @@ Improvements over v0.1:
   - staging temp dir always cleaned up (try/finally)
   - Circular dependency error now shows the full cycle path
   - autoremove command implemented
-  - upgrade command (stub, ready for implementation)
   - info command (package details)
   - list --verbose shows timestamps
   - search shows [installed] marker
   - SandboxEngine adds --unshare-net and --die-with-parent
-  - Duplicate "Running self tests" print fixed
-  - read chunk size raised to 64 KB for throughput
+  - Read chunk size raised to 64 KB for throughput
   - Added structured logging (-v / --verbose)
   - --version flag added
-  - All VeroPkgError subclasses caught in main() — no raw tracebacks
+  - [v0.2.1] upgrade command fully implemented with file cleanup and dependency resolution
+  - [v0.2.2] Advanced Exception hierarchy (NetworkError, LockError, ChecksumError) with hints
 """
 
 import argparse
@@ -36,6 +35,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -46,13 +46,13 @@ except ImportError:
     HAS_FCNTL = False
 
 try:
-    from packaging import version  # noqa: F401  (used by callers / future upgrade cmd)
+    from packaging import version  # noqa: F401
 except ImportError:
     print("Missing dependency: python-packaging")
     print("  pip install packaging")
     sys.exit(1)
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -85,10 +85,10 @@ _PKG_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$')
 # ---------------------------------------------------------------------------
 
 DEFAULT_REPO: dict = {
-    "glibc":   {"version": "2.38",  "deps": [],                   "url": "demo", "sha256": "demo"},
-    "wayland": {"version": "1.22",  "deps": ["glibc"],            "url": "demo", "sha256": "demo"},
+    "glibc":   {"version": "2.38",  "deps": [],                    "url": "demo", "sha256": "demo"},
+    "wayland": {"version": "1.22",  "deps": ["glibc"],             "url": "demo", "sha256": "demo"},
     "mesa":    {"version": "24.0",  "deps": ["glibc", "wayland"], "url": "demo", "sha256": "demo"},
-    "firefox": {"version": "123.0", "deps": ["mesa"],             "url": "demo", "sha256": "demo"},
+    "firefox": {"version": "123.0", "deps": ["mesa"],              "url": "demo", "sha256": "demo"},
 }
 
 log = logging.getLogger("veropkg")
@@ -100,9 +100,12 @@ log = logging.getLogger("veropkg")
 class VeroPkgError(Exception):       pass
 class DependencyError(VeroPkgError): pass
 class SecurityError(VeroPkgError):   pass
+class ChecksumError(SecurityError):  pass
 class FileConflictError(VeroPkgError): pass
 class PackageNotFoundError(VeroPkgError): pass
 class ValidationError(VeroPkgError): pass
+class NetworkError(VeroPkgError):    pass
+class LockError(VeroPkgError):       pass
 
 # ---------------------------------------------------------------------------
 # Input validation
@@ -184,14 +187,7 @@ def is_safe_path(base: str, target: str) -> bool:
 
 
 def safe_extract(tar: tarfile.TarFile, dest: str) -> list[str]:
-    """Extract *tar* into *dest* with full security checks.
-
-    Raises SecurityError for:
-      - Path traversal
-      - Symlinks / hard-links
-      - Device nodes
-      - Files exceeding MAX_DOWNLOAD_BYTES
-    """
+    """Extract *tar* into *dest* with full security checks."""
     extracted: list[str] = []
     for member in tar.getmembers():
         target = os.path.join(dest, member.name)
@@ -238,7 +234,7 @@ class PackageLock:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 self._fd.close()
-                raise VeroPkgError(
+                raise LockError(
                     f"Another veropkg process is running (lock: {LOCKFILE}). "
                     "Wait for it to finish or remove the lock file if stale."
                 )
@@ -276,6 +272,8 @@ class Repository:
             print(f"✓ Repository updated  ({len(data)} packages)")
             log.debug("Repo synced: %d packages", len(data))
 
+        except urllib.error.URLError as e:
+            raise NetworkError(f"Failed to connect to repository: {e.reason}")
         except VeroPkgError:
             raise
         except Exception as exc:
@@ -434,9 +432,12 @@ class Installer:
                     meta["url"],
                     headers={"User-Agent": f"veropkg/{__version__}"},
                 )
-                with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
-                    with open(package_path, "wb") as fout:
-                        shutil.copyfileobj(resp, fout, length=65536)
+                try:
+                    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+                        with open(package_path, "wb") as fout:
+                            shutil.copyfileobj(resp, fout, length=65536)
+                except urllib.error.URLError as e:
+                    raise NetworkError(f"Download failed for {pkg}: {e.reason}")
             else:
                 # Demo stub: create a minimal tar.gz
                 with tarfile.open(package_path, "w:gz") as tar:
@@ -453,7 +454,7 @@ class Installer:
                 print(f"  Verifying {pkg} ...")
                 actual = sha256sum(package_path)
                 if actual != expected:
-                    raise SecurityError(
+                    raise ChecksumError(
                         f"SHA256 mismatch for {pkg}:\n"
                         f"  expected {expected}\n"
                         f"  got      {actual}"
@@ -561,6 +562,99 @@ class Remover:
             print(f"\n✓ Removed {len(removed)} unused package(s): {', '.join(removed)}")
         else:
             print("No unused packages to remove.")
+
+# ---------------------------------------------------------------------------
+# Upgrader
+# ---------------------------------------------------------------------------
+
+class Upgrader:
+    def __init__(self, repo: dict):
+        self.repo = repo
+        self.installed = load_json(INSTALLED_DB)
+        self.files_db = load_json(FILES_DB)
+
+    def upgrade_all(self) -> None:
+        """Finds and upgrades all installed packages with a newer version in the repo."""
+        upgradable = []
+        for pkg, meta in self.installed.items():
+            if pkg in self.repo:
+                installed_ver = version.parse(meta["version"])
+                repo_ver = version.parse(self.repo[pkg]["version"])
+                if repo_ver > installed_ver:
+                    upgradable.append(pkg)
+
+        if not upgradable:
+            print("All packages are up-to-date.")
+            return
+
+        print(f"Found {len(upgradable)} package(s) to upgrade: {', '.join(upgradable)}")
+        for pkg in upgradable:
+            self.upgrade_package(pkg)
+
+    def upgrade_package(self, pkg: str) -> None:
+        """Upgrades a single package and its dependencies safely."""
+        pkg = validate_package_name(pkg)
+        if pkg not in self.installed:
+            print(f"{pkg} is not installed. Use 'install' to install it first.")
+            return
+        if pkg not in self.repo:
+            print(f"Warning: {pkg} is not in the current repository.")
+            return
+
+        installed_ver = version.parse(self.installed[pkg]["version"])
+        repo_ver = version.parse(self.repo[pkg]["version"])
+
+        if repo_ver <= installed_ver:
+            print(f"{pkg} is already at the latest version ({installed_ver}).")
+            return
+
+        print(f"\nUpgrading {pkg} ({installed_ver} -> {repo_ver}) ...")
+
+        installer = Installer(self.repo)
+        plan = DependencyResolver(self.repo).resolve(pkg)
+
+        # Filter the plan for packages that are missing OR have an available upgrade
+        to_install = []
+        for p in plan:
+            if p not in self.installed:
+                to_install.append(p)
+            elif version.parse(self.repo[p]["version"]) > version.parse(self.installed[p]["version"]):
+                to_install.append(p)
+
+        # Snapshot the old files to detect orphaned files after the upgrade
+        old_files_map = {p: set(self.installed.get(p, {}).get("files", [])) for p in to_install}
+
+        with Transaction() as tx:
+            for p in to_install:
+                # Maintain the "auto_installed" flag for dependencies during upgrade
+                is_auto = self.installed.get(p, {}).get("auto_installed", p != pkg)
+                installer._install_one(p, tx, auto=is_auto)
+
+            # Cleanup orphaned files (files present in the old version but absent in the new)
+            for p in to_install:
+                if p in old_files_map:
+                    new_files = set(installer.installed[p].get("files", []))
+                    orphans = old_files_map[p] - new_files
+                    for f in orphans:
+                        p_path = Path(f)
+                        if p_path.exists():
+                            tx.backup(p_path)
+                            try:
+                                p_path.unlink()
+                            except Exception as exc:
+                                log.warning("Could not remove orphaned file %s: %s", p_path, exc)
+                        installer.files_db.pop(f, None)
+
+            # Commit the shared installer state
+            atomic_save_json(INSTALLED_DB, installer.installed)
+            atomic_save_json(FILES_DB, installer.files_db)
+            tx.commit()
+
+        print(f"✓ Upgrade of {pkg} complete.")
+        
+        # Sync back the local state
+        self.installed = installer.installed
+        self.files_db = installer.files_db
 
 # ---------------------------------------------------------------------------
 # Sandbox
@@ -839,6 +933,9 @@ def main() -> None:
     p_inst = sub.add_parser("install",    help="Install a package and its deps")
     p_inst.add_argument("package")
 
+    p_upg = sub.add_parser("upgrade", help="Upgrade a package (or all if none specified)")
+    p_upg.add_argument("package", nargs="?", help="Specific package to upgrade (optional)")
+
     p_rem = sub.add_parser("remove",     help="Remove an installed package")
     p_rem.add_argument("package")
     p_rem.add_argument("--force", action="store_true",
@@ -877,6 +974,12 @@ def main() -> None:
                 case "install":
                     require_root()
                     Installer(repo.repo).install(args.package)
+                case "upgrade":
+                    require_root()
+                    if args.package:
+                        Upgrader(repo.repo).upgrade_package(args.package)
+                    else:
+                        Upgrader(repo.repo).upgrade_all()
                 case "remove":
                     require_root()
                     Remover(repo.repo).remove(args.package, force=args.force)
@@ -895,11 +998,30 @@ def main() -> None:
                     run_self_tests()
 
     except KeyboardInterrupt:
-        print("\nAborted.")
+        print("\nAborted by user.")
         sys.exit(130)
+    except LockError as exc:
+        log.debug("Lock collision", exc_info=True)
+        print(f"\n[Lock Error] {exc}", file=sys.stderr)
+        print("Hint: If you are sure no other veropkg instance is running, delete veropkg_data/veropkg.lock", file=sys.stderr)
+        sys.exit(1)
+    except NetworkError as exc:
+        log.debug("Network failure", exc_info=True)
+        print(f"\n[Network Error] Could not reach the repository/package URL: {exc}", file=sys.stderr)
+        print("Hint: Check your internet connection or repository URL.", file=sys.stderr)
+        sys.exit(1)
+    except ChecksumError as exc:
+        log.error("Integrity check failed", exc_info=True)
+        print(f"\n[Integrity Error] {exc}", file=sys.stderr)
+        print("Hint: The package may be corrupted or compromised. Try clearing the cache.", file=sys.stderr)
+        sys.exit(1)
+    except DependencyError as exc:
+        log.error("Dependency resolution failed", exc_info=True)
+        print(f"\n[Dependency Error] {exc}", file=sys.stderr)
+        sys.exit(1)
     except VeroPkgError as exc:
-        log.debug("", exc_info=True)
-        print(f"\nError: {exc}", file=sys.stderr)
+        log.debug("Generic veropkg error", exc_info=True)
+        print(f"\n[Error] {exc}", file=sys.stderr)
         sys.exit(1)
 
 
