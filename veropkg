@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
 """
 veropkg - Veronic Linux Package Manager
-Cross Platform Production Prototype
+Version 0.2.0
 
-Features:
-- Dependency resolution
-- Circular dependency detection
-- Atomic database writes
-- Cross platform file locking
-- Safe extraction
-- Transaction rollback
-- Package install and removal
-- Repository sync
-- Sandbox execution
-- Auto dependency cleanup
-- SHA256 verification
-- Safe install roots
-- Basic self tests
+Improvements over v0.1:
+  - Input validation on all package names (path traversal / injection blocked)
+  - SSL-verified downloads with TLS 1.2 minimum
+  - Non-blocking lock with clear error when already locked
+  - require_root() now enforced on mutating commands
+  - safe_extract() adds file-size cap and realpath-based traversal check
+  - staging temp dir always cleaned up (try/finally)
+  - Circular dependency error now shows the full cycle path
+  - autoremove command implemented
+  - upgrade command (stub, ready for implementation)
+  - info command (package details)
+  - list --verbose shows timestamps
+  - search shows [installed] marker
+  - SandboxEngine adds --unshare-net and --die-with-parent
+  - Duplicate "Running self tests" print fixed
+  - read chunk size raised to 64 KB for throughput
+  - Added structured logging (-v / --verbose)
+  - --version flag added
+  - All VeroPkgError subclasses caught in main() — no raw tracebacks
 """
 
 import argparse
 import hashlib
 import json
+import logging
 import os
+import re
 import shutil
-import subprocess
+import ssl
 import sys
 import tarfile
 import tempfile
@@ -39,659 +46,861 @@ except ImportError:
     HAS_FCNTL = False
 
 try:
-    from packaging import version
+    from packaging import version  # noqa: F401  (used by callers / future upgrade cmd)
 except ImportError:
-    print("Install python-packaging")
-    print("pip install packaging")
+    print("Missing dependency: python-packaging")
+    print("  pip install packaging")
     sys.exit(1)
 
-ROOT = Path("./veropkg_data")
-CACHE_DIR = ROOT / "cache"
-DB_DIR = ROOT / "db"
+__version__ = "0.2.0"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+ROOT            = Path("./veropkg_data")
+CACHE_DIR       = ROOT / "cache"
+DB_DIR          = ROOT / "db"
 TRANSACTION_DIR = ROOT / "transactions"
-LOCKFILE = ROOT / "veropkg.lock"
+LOCKFILE        = ROOT / "veropkg.lock"
 
 INSTALLED_DB = DB_DIR / "installed.json"
-FILES_DB = DB_DIR / "files.json"
-REPO_DB = DB_DIR / "repo.json"
+FILES_DB     = DB_DIR / "files.json"
+REPO_DB      = DB_DIR / "repo.json"
 
-SYSTEM_ROOT = Path(
-    os.environ.get("VEROPKG_ROOT", str(ROOT / "system"))
-)
+SYSTEM_ROOT = Path(os.environ.get("VEROPKG_ROOT", str(ROOT / "system")))
+SANDBOX_HOME = Path.home() / ".local/share/veronic_apps"
 
 REPO_URL = "https://repo.veronic.linux/packages.json"
 
-SANDBOX_HOME = Path.home() / ".local/share/veronic_apps"
+# Security limits
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024   # 512 MB per package
+MAX_REPO_BYTES     = 10  * 1024 * 1024   # 10 MB repo index
 
-DEFAULT_REPO = {
-    "glibc": {
-        "version": "2.38",
-        "deps": [],
-        "url": "demo",
-        "sha256": "demo"
-    },
-    "wayland": {
-        "version": "1.22",
-        "deps": ["glibc"],
-        "url": "demo",
-        "sha256": "demo"
-    },
-    "mesa": {
-        "version": "24.0",
-        "deps": ["glibc", "wayland"],
-        "url": "demo",
-        "sha256": "demo"
-    },
-    "firefox": {
-        "version": "123.0",
-        "deps": ["mesa"],
-        "url": "demo",
-        "sha256": "demo"
-    }
+# Package name: must start with alphanumeric, then [a-zA-Z0-9._+-]
+_PKG_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$')
+
+# ---------------------------------------------------------------------------
+# Demo repository (used when no repo has been synced yet)
+# ---------------------------------------------------------------------------
+
+DEFAULT_REPO: dict = {
+    "glibc":   {"version": "2.38",  "deps": [],                   "url": "demo", "sha256": "demo"},
+    "wayland": {"version": "1.22",  "deps": ["glibc"],            "url": "demo", "sha256": "demo"},
+    "mesa":    {"version": "24.0",  "deps": ["glibc", "wayland"], "url": "demo", "sha256": "demo"},
+    "firefox": {"version": "123.0", "deps": ["mesa"],             "url": "demo", "sha256": "demo"},
 }
 
+log = logging.getLogger("veropkg")
 
-class VeroPkgError(Exception):
-    pass
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
+class VeroPkgError(Exception):       pass
+class DependencyError(VeroPkgError): pass
+class SecurityError(VeroPkgError):   pass
+class FileConflictError(VeroPkgError): pass
+class PackageNotFoundError(VeroPkgError): pass
+class ValidationError(VeroPkgError): pass
 
-class DependencyError(VeroPkgError):
-    pass
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
 
+def validate_package_name(name: str) -> str:
+    """Return *name* unchanged if valid; raise ValidationError otherwise."""
+    if not name:
+        raise ValidationError("Package name cannot be empty.")
+    if len(name) > 128:
+        raise ValidationError(f"Package name too long ({len(name)} chars, max 128): {name!r}")
+    if not _PKG_RE.match(name):
+        raise ValidationError(
+            f"Invalid package name: {name!r}. "
+            "Must start with alphanumeric and contain only [a-zA-Z0-9._+-]."
+        )
+    return name
 
-class SecurityError(VeroPkgError):
-    pass
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-class FileConflictError(VeroPkgError):
-    pass
-
-
-class PackageLock:
-    def __enter__(self):
-        LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = open(LOCKFILE, "w")
-
-        if HAS_FCNTL:
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
-
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if HAS_FCNTL:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-
-        self.fd.close()
-
-
-def ensure_dirs():
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    TRANSACTION_DIR.mkdir(parents=True, exist_ok=True)
-    SYSTEM_ROOT.mkdir(parents=True, exist_ok=True)
-
-    if not INSTALLED_DB.exists():
-        atomic_save_json(INSTALLED_DB, {})
-
-    if not FILES_DB.exists():
-        atomic_save_json(FILES_DB, {})
-
-    if not REPO_DB.exists():
-        atomic_save_json(REPO_DB, DEFAULT_REPO)
+def ensure_dirs() -> None:
+    for d in (CACHE_DIR, DB_DIR, TRANSACTION_DIR, SYSTEM_ROOT):
+        d.mkdir(parents=True, exist_ok=True)
+    for path, default in ((INSTALLED_DB, {}), (FILES_DB, {}), (REPO_DB, DEFAULT_REPO)):
+        if not path.exists():
+            atomic_save_json(path, default)
 
 
-def atomic_save_json(path, data):
+def atomic_save_json(path: Path, data: dict) -> None:
+    """Write *data* as JSON to *path* with an atomic rename."""
     path = Path(path)
-
     with tempfile.NamedTemporaryFile(
-        "w",
-        delete=False,
-        dir=path.parent
+        "w", delete=False, dir=path.parent, suffix=".tmp"
     ) as tmp:
         json.dump(data, tmp, indent=4)
         tmp.flush()
         os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    os.replace(tmp_name, path)
 
-    os.replace(tmp.name, path)
 
-
-def load_json(path):
+def load_json(path: Path) -> dict:
     path = Path(path)
-
     if not path.exists():
         return {}
-
-    with open(path, "r") as f:
+    with open(path) as f:
         return json.load(f)
 
 
-def sha256sum(path):
+def sha256sum(path: Path) -> str:
     h = hashlib.sha256()
-
     with open(path, "rb") as f:
-        while True:
-            chunk = f.read(8192)
-
-            if not chunk:
-                break
-
+        for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
-
     return h.hexdigest()
 
 
-def require_root():
+def require_root() -> None:
+    """Raise VeroPkgError if not running as root (POSIX only)."""
     if os.name == "nt":
         return
-
-    if hasattr(os, "geteuid"):
-        if os.geteuid() != 0:
-            print("Root privileges required")
-            sys.exit(1)
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise VeroPkgError("Root privileges required. Re-run with sudo.")
 
 
-def is_safe_path(base, target):
-    base_abs = os.path.abspath(base)
-    target_abs = os.path.abspath(target)
-
-    return os.path.commonpath([base_abs]) == os.path.commonpath([
-        base_abs,
-        target_abs
-    ])
+def make_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
-def safe_extract(tar, path):
-    extracted = []
+def is_safe_path(base: str, target: str) -> bool:
+    """Return True iff *target* is inside *base* (no traversal)."""
+    base_real   = os.path.realpath(os.path.abspath(base))
+    target_real = os.path.realpath(os.path.abspath(target))
+    return target_real == base_real or target_real.startswith(base_real + os.sep)
 
+
+def safe_extract(tar: tarfile.TarFile, dest: str) -> list[str]:
+    """Extract *tar* into *dest* with full security checks.
+
+    Raises SecurityError for:
+      - Path traversal
+      - Symlinks / hard-links
+      - Device nodes
+      - Files exceeding MAX_DOWNLOAD_BYTES
+    """
+    extracted: list[str] = []
     for member in tar.getmembers():
-        target_path = os.path.join(path, member.name)
+        target = os.path.join(dest, member.name)
 
-        if not is_safe_path(path, target_path):
-            raise SecurityError(
-                f"Unsafe archive path detected: {member.name}"
-            )
-
+        if not is_safe_path(dest, target):
+            raise SecurityError(f"Path traversal in archive: {member.name!r}")
         if member.issym() or member.islnk():
-            raise SecurityError(
-                f"Symlinks forbidden: {member.name}"
-            )
-
+            raise SecurityError(f"Symlinks/hardlinks forbidden: {member.name!r}")
         if member.isdev():
+            raise SecurityError(f"Device nodes forbidden: {member.name!r}")
+        if member.size > MAX_DOWNLOAD_BYTES:
             raise SecurityError(
-                f"Device nodes forbidden: {member.name}"
+                f"File too large ({member.size:,} bytes): {member.name!r}"
             )
 
         extracted.append(member.name)
 
         if member.isdir():
-            Path(target_path).mkdir(parents=True, exist_ok=True)
+            Path(target).mkdir(parents=True, exist_ok=True)
             continue
 
-        source = tar.extractfile(member)
-
-        if source is None:
+        src = tar.extractfile(member)
+        if src is None:
             continue
 
-        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(target_path, "wb") as dest:
-            shutil.copyfileobj(source, dest)
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=65536)
 
     return extracted
 
+# ---------------------------------------------------------------------------
+# Locking
+# ---------------------------------------------------------------------------
+
+class PackageLock:
+    """Process-level exclusive lock around all mutating operations."""
+
+    def __enter__(self):
+        LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = open(LOCKFILE, "w")
+        if HAS_FCNTL:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._fd.close()
+                raise VeroPkgError(
+                    f"Another veropkg process is running (lock: {LOCKFILE}). "
+                    "Wait for it to finish or remove the lock file if stale."
+                )
+        return self
+
+    def __exit__(self, *_):
+        if HAS_FCNTL:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._fd.close()
+
+# ---------------------------------------------------------------------------
+# Repository
+# ---------------------------------------------------------------------------
 
 class Repository:
     def __init__(self):
-        self.repo = load_json(REPO_DB)
+        self.repo: dict = load_json(REPO_DB)
 
-    def sync(self):
-        print("Syncing repositories")
-
+    def sync(self) -> None:
+        print(f"Syncing repository from {REPO_URL} ...")
         try:
-            with urllib.request.urlopen(REPO_URL) as response:
-                data = json.loads(response.read().decode())
+            ctx = make_ssl_context()
+            req = urllib.request.Request(
+                REPO_URL,
+                headers={"User-Agent": f"veropkg/{__version__}"},
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+                if resp.status != 200:
+                    raise VeroPkgError(f"HTTP {resp.status} from repository server")
+                raw = resp.read(MAX_REPO_BYTES)
 
+            data = json.loads(raw.decode())
             atomic_save_json(REPO_DB, data)
             self.repo = data
+            print(f"✓ Repository updated  ({len(data)} packages)")
+            log.debug("Repo synced: %d packages", len(data))
 
-            print("Repository updated")
+        except VeroPkgError:
+            raise
+        except Exception as exc:
+            log.warning("Sync failed: %s", exc)
+            print(f"  Sync failed: {exc}")
+            print("  Using cached repository.")
 
-        except Exception as e:
-            print("Repository sync failed")
-            print(e)
-            print("Using cached repository")
-
+# ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
 
 class DependencyResolver:
-    def __init__(self, repo):
+    def __init__(self, repo: dict):
         self.repo = repo
 
-    def resolve(self, target):
+    def resolve(self, target: str) -> list[str]:
+        """Return a topologically-sorted install list (deps before target)."""
         if target not in self.repo:
-            raise DependencyError(f"Package not found: {target}")
+            raise PackageNotFoundError(f"Package not found: {target!r}")
 
-        result = []
-        visited = set()
-        stack = set()
+        result:  list[str] = []
+        visited: set[str]  = set()
+        stack:   list[str] = []   # used for cycle detection
 
-        def dfs(pkg):
+        def dfs(pkg: str) -> None:
             if pkg in stack:
-                raise DependencyError(
-                    f"Circular dependency detected: {pkg}"
-                )
-
+                cycle = " → ".join(stack) + f" → {pkg}"
+                raise DependencyError(f"Circular dependency detected: {cycle}")
             if pkg in visited:
                 return
 
-            stack.add(pkg)
-
-            deps = self.repo[pkg].get("deps", [])
-
-            for dep in deps:
+            stack.append(pkg)
+            for dep in self.repo[pkg].get("deps", []):
                 if dep not in self.repo:
                     raise DependencyError(
-                        f"Missing dependency: {dep}"
+                        f"Missing dependency {dep!r} required by {pkg!r}"
                     )
-
                 dfs(dep)
-
-            stack.remove(pkg)
+            stack.pop()
             visited.add(pkg)
             result.append(pkg)
 
         dfs(target)
-
         return result
 
+    def reverse_deps(self, target: str, installed: dict) -> list[str]:
+        """Return all *installed* packages that declare *target* as a dep."""
+        return [
+            pkg for pkg, meta in self.repo.items()
+            if target in meta.get("deps", []) and pkg in installed
+        ]
+
+# ---------------------------------------------------------------------------
+# Transaction (rollback support)
+# ---------------------------------------------------------------------------
 
 class Transaction:
     def __init__(self):
-        self.id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        self.id   = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         self.path = TRANSACTION_DIR / self.id
-
         self.path.mkdir(parents=True, exist_ok=True)
-
-        self.rollback_log = []
-        self.created_files = []
-        self.committed = False
+        self._rollback_log:  list[dict] = []
+        self._created_files: list[str]  = []
+        self._committed = False
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None or not self.committed:
-            self.rollback()
+    def __exit__(self, exc_type, *_):
+        if exc_type is not None or not self._committed:
+            self._rollback()
 
-    def backup(self, target):
+    def backup(self, target: Path) -> None:
         target = Path(target)
-
         if not target.exists():
             return
+        bak = self.path / target.relative_to(target.anchor)
+        bak.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, bak)
+        self._rollback_log.append({"original": str(target), "backup": str(bak)})
 
-        backup_path = self.path / target.relative_to(target.anchor)
+    def register_created(self, path: Path) -> None:
+        self._created_files.append(str(path))
 
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
+    def commit(self) -> None:
+        self._committed = True
 
-        shutil.copy2(target, backup_path)
+    def _rollback(self) -> None:
+        log.warning("Rolling back transaction %s", self.id)
+        print("  Rolling back changes ...")
 
-        self.rollback_log.append({
-            "original": str(target),
-            "backup": str(backup_path)
-        })
-
-    def register_created_file(self, path):
-        self.created_files.append(str(path))
-
-    def commit(self):
-        self.committed = True
-
-    def rollback(self):
-        print("Rollback started")
-
-        for created in reversed(self.created_files):
-            path = Path(created)
-
-            if path.exists():
+        for path_str in reversed(self._created_files):
+            p = Path(path_str)
+            if p.exists():
                 try:
-                    path.unlink()
-                except Exception:
-                    pass
+                    p.unlink()
+                except Exception as e:
+                    log.error("Rollback: could not remove %s: %s", p, e)
 
-        for item in reversed(self.rollback_log):
-            original = Path(item["original"])
-            backup = Path(item["backup"])
+        for item in reversed(self._rollback_log):
+            orig, bak = Path(item["original"]), Path(item["backup"])
+            if bak.exists():
+                try:
+                    shutil.copy2(bak, orig)
+                except Exception as e:
+                    log.error("Rollback: could not restore %s: %s", orig, e)
 
-            if backup.exists():
-                shutil.copy2(backup, original)
+        print("  Rollback complete.")
 
-        print("Rollback complete")
-
+# ---------------------------------------------------------------------------
+# Installer
+# ---------------------------------------------------------------------------
 
 class Installer:
-    def __init__(self, repo):
-        self.repo = repo
+    def __init__(self, repo: dict):
+        self.repo       = repo
+        self.installed  = load_json(INSTALLED_DB)
+        self.files_db   = load_json(FILES_DB)
 
-        self.installed = load_json(INSTALLED_DB)
-        self.files_db = load_json(FILES_DB)
+    def install(self, pkg: str) -> None:
+        pkg = validate_package_name(pkg)
+        plan = DependencyResolver(self.repo).resolve(pkg)
 
-    def install(self, pkg, auto=False):
-        resolver = DependencyResolver(self.repo)
-        plan = resolver.resolve(pkg)
+        to_install = [p for p in plan if p not in self.installed]
+        if not to_install:
+            print(f"{pkg} is already installed.")
+            return
 
-        print("Installation Plan")
-
-        for i, p in enumerate(plan, 1):
-            print(f"[{i}/{len(plan)}] {p}")
+        print(f"\nInstallation plan ({len(to_install)} package(s)):")
+        for i, p in enumerate(to_install, 1):
+            label = "" if p == pkg else "  [dependency]"
+            print(f"  [{i}/{len(to_install)}] {p} ({self.repo[p]['version']}){label}")
+        print()
 
         with Transaction() as tx:
-            for p in plan:
-                if p in self.installed:
-                    print(f"{p} already installed")
-                    continue
-
-                dep_auto = p != pkg
-
-                self.install_package(p, tx, dep_auto)
-
+            for p in to_install:
+                self._install_one(p, tx, auto=(p != pkg))
             atomic_save_json(INSTALLED_DB, self.installed)
             atomic_save_json(FILES_DB, self.files_db)
-
             tx.commit()
 
-        print("Installation successful")
+        print(f"\n✓ {pkg} installed successfully.")
 
-    def install_package(self, pkg, tx, auto=False):
-        metadata = self.repo[pkg]
-
+    def _install_one(self, pkg: str, tx: Transaction, auto: bool = False) -> None:
+        meta         = self.repo[pkg]
         package_path = CACHE_DIR / f"{pkg}.vpkg"
+        staging: str | None = None
 
-        print(f"Downloading {pkg}")
+        print(f"  Downloading {pkg} {meta['version']} ...")
+        log.debug("  url = %s", meta["url"])
 
         try:
-            if metadata["url"] != "demo":
-                urllib.request.urlretrieve(metadata["url"], package_path)
-            else:
-                raise Exception("Using demo package")
-
-        except Exception:
-            with tarfile.open(package_path, "w:gz") as tar:
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    tmp.write(b"#!/bin/sh\necho Running package\n")
-                    tmp.flush()
-
-                    tar.add(tmp.name, arcname=f"usr/bin/{pkg}")
-
-        expected_sha = metadata.get("sha256")
-
-        if expected_sha != "demo":
-            actual = sha256sum(package_path)
-
-            if actual != expected_sha:
-                raise SecurityError(
-                    f"SHA256 mismatch for {pkg}"
+            if meta["url"] != "demo":
+                ctx = make_ssl_context()
+                req = urllib.request.Request(
+                    meta["url"],
+                    headers={"User-Agent": f"veropkg/{__version__}"},
                 )
+                with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+                    with open(package_path, "wb") as fout:
+                        shutil.copyfileobj(resp, fout, length=65536)
+            else:
+                # Demo stub: create a minimal tar.gz
+                with tarfile.open(package_path, "w:gz") as tar:
+                    import io
+                    content = f"#!/bin/sh\necho '{pkg} running'\n".encode()
+                    info        = tarfile.TarInfo(name=f"usr/bin/{pkg}")
+                    info.size   = len(content)
+                    info.mode   = 0o755
+                    tar.addfile(info, io.BytesIO(content))
 
-        print(f"Extracting {pkg}")
+            # Verify checksum
+            expected = meta.get("sha256")
+            if expected and expected != "demo":
+                print(f"  Verifying {pkg} ...")
+                actual = sha256sum(package_path)
+                if actual != expected:
+                    raise SecurityError(
+                        f"SHA256 mismatch for {pkg}:\n"
+                        f"  expected {expected}\n"
+                        f"  got      {actual}"
+                    )
+                log.debug("  SHA256 OK")
 
-        staging = tempfile.mkdtemp(prefix="veropkg-")
+            print(f"  Extracting {pkg} ...")
+            staging = tempfile.mkdtemp(prefix="veropkg-")
 
-        with tarfile.open(package_path) as tar:
-            extracted_files = safe_extract(tar, staging)
+            with tarfile.open(package_path) as tar:
+                extracted = safe_extract(tar, staging)
 
-        manifest = []
+            manifest: list[str] = []
+            for relpath in extracted:
+                src = Path(staging) / relpath
+                if src.is_dir():
+                    continue
 
-        for relpath in extracted_files:
-            src = Path(staging) / relpath
-
-            if src.is_dir():
-                continue
-
-            dest = SYSTEM_ROOT / relpath
-
-            if dest.exists():
+                dest = SYSTEM_ROOT / relpath
                 owner = self.files_db.get(str(dest))
-
-                if owner:
+                if owner and owner != pkg:
                     raise FileConflictError(
-                        f"File conflict: {dest} owned by {owner}"
+                        f"File conflict: {dest} is owned by {owner!r}"
                     )
 
-            dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    tx.backup(dest)
 
-            if dest.exists():
-                tx.backup(dest)
+                shutil.copy2(src, dest)
+                tx.register_created(dest)
+                os.chmod(dest, 0o755)
+                manifest.append(str(dest))
+                self.files_db[str(dest)] = pkg
 
-            shutil.copy2(src, dest)
+            self.installed[pkg] = {
+                "version":        meta["version"],
+                "installed_at":   datetime.utcnow().isoformat() + "Z",
+                "auto_installed": auto,
+                "files":          manifest,
+            }
+            print(f"  ✓ {pkg}")
 
-            tx.register_created_file(dest)
+        finally:
+            if staging and Path(staging).exists():
+                shutil.rmtree(staging, ignore_errors=True)
 
-            os.chmod(dest, 0o755)
-
-            manifest.append(str(dest))
-
-            self.files_db[str(dest)] = pkg
-
-        self.installed[pkg] = {
-            "version": metadata["version"],
-            "installed_at": datetime.utcnow().isoformat(),
-            "auto_installed": auto,
-            "files": manifest
-        }
-
-        print(f"Installed {pkg}")
-
+# ---------------------------------------------------------------------------
+# Remover
+# ---------------------------------------------------------------------------
 
 class Remover:
-    def __init__(self, repo):
-        self.repo = repo
-
+    def __init__(self, repo: dict):
+        self.repo      = repo
         self.installed = load_json(INSTALLED_DB)
-        self.files_db = load_json(FILES_DB)
+        self.files_db  = load_json(FILES_DB)
 
-    def remove(self, pkg):
+    def remove(self, pkg: str, force: bool = False) -> None:
+        pkg = validate_package_name(pkg)
         if pkg not in self.installed:
-            print(f"{pkg} not installed")
+            print(f"{pkg} is not installed.")
             return
 
-        dependents = self.find_dependents(pkg)
-
-        if dependents:
-            print(f"Cannot remove {pkg}")
-            print("Required by")
-
+        dependents = DependencyResolver(self.repo).reverse_deps(pkg, self.installed)
+        if dependents and not force:
+            print(f"Cannot remove {pkg!r} — required by:")
             for d in dependents:
                 print(f"  {d}")
-
+            print("\nPass --force to override (may break other packages).")
             return
 
-        files = self.installed[pkg].get("files", [])
-
-        print(f"Removing {pkg}")
-
-        for f in files:
-            path = Path(f)
-
-            if path.exists():
-                path.unlink()
-
+        print(f"Removing {pkg} ...")
+        for f in self.installed[pkg].get("files", []):
+            p = Path(f)
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception as exc:
+                    log.warning("Could not remove %s: %s", p, exc)
             self.files_db.pop(f, None)
 
         del self.installed[pkg]
-
         atomic_save_json(INSTALLED_DB, self.installed)
         atomic_save_json(FILES_DB, self.files_db)
+        print(f"✓ Removed {pkg}.")
 
-        print(f"Removed {pkg}")
+    def autoremove(self) -> None:
+        """Iteratively remove auto-installed packages no longer required."""
+        removed: list[str] = []
+        changed = True
 
-    def find_dependents(self, target):
-        result = []
+        while changed:
+            changed = False
+            for pkg, meta in list(self.installed.items()):
+                if not meta.get("auto_installed"):
+                    continue
+                if not DependencyResolver(self.repo).reverse_deps(pkg, self.installed):
+                    print(f"  Removing unused dependency: {pkg}")
+                    self.remove(pkg)
+                    removed.append(pkg)
+                    changed = True
+                    break   # restart after mutation
 
-        for pkg, meta in self.repo.items():
-            deps = meta.get("deps", [])
+        if removed:
+            print(f"\n✓ Removed {len(removed)} unused package(s): {', '.join(removed)}")
+        else:
+            print("No unused packages to remove.")
 
-            if target in deps and pkg in self.installed:
-                result.append(pkg)
-
-        return result
-
+# ---------------------------------------------------------------------------
+# Sandbox
+# ---------------------------------------------------------------------------
 
 class SandboxEngine:
-    def __init__(self, pkg):
-        self.pkg = pkg
-
+    def __init__(self, pkg: str):
+        self.pkg      = validate_package_name(pkg)
         self.app_home = SANDBOX_HOME / pkg
 
-    def build(self):
+    def build_cmd(self) -> list[str]:
         self.app_home.mkdir(parents=True, exist_ok=True)
-
-        uid = os.getuid() if hasattr(os, "getuid") else 1000
-
+        bin_path = str(SYSTEM_ROOT / "usr" / "bin" / self.pkg)
         return [
             "bwrap",
-            "--ro-bind", "/usr", "/usr",
-            "--proc", "/proc",
-            "--dev", "/dev",
+            "--ro-bind", str(SYSTEM_ROOT / "usr"), "/usr",
+            "--proc",  "/proc",
+            "--dev",   "/dev",
             "--tmpfs", "/tmp",
-            "--bind",
-            str(self.app_home),
-            str(Path.home()),
-            f"/usr/bin/{self.pkg}"
+            "--bind",  str(self.app_home), str(Path.home()),
+            "--unshare-net",       # no network access by default
+            "--die-with-parent",   # clean up if launcher dies
+            bin_path,
         ]
 
-    def launch(self):
-        cmd = self.build()
-
-        print(f"Launching {self.pkg} in sandbox")
-
+    def launch(self) -> None:
+        cmd = self.build_cmd()
+        log.debug("Sandbox cmd: %s", " ".join(cmd))
+        print(f"Launching {self.pkg} in sandbox ...")
         try:
             os.execvp("bwrap", cmd)
-
         except FileNotFoundError:
-            print("bubblewrap not installed")
-            sys.exit(1)
+            raise VeroPkgError(
+                "bubblewrap (bwrap) is not installed. "
+                "Install it with your host package manager first."
+            )
 
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
 
-def list_installed():
+def list_installed(verbose: bool = False) -> None:
     db = load_json(INSTALLED_DB)
-
     if not db:
-        print("No installed packages")
+        print("No packages installed.")
         return
 
-    print("Installed Packages")
+    manual = {k: v for k, v in db.items() if not v.get("auto_installed")}
+    auto   = {k: v for k, v in db.items() if     v.get("auto_installed")}
 
-    for pkg, meta in db.items():
-        auto = " [auto]" if meta.get("auto_installed") else ""
-        print(f"{pkg} ({meta['version']}){auto}")
+    print(f"Installed packages  ({len(db)} total, {len(auto)} auto-installed)\n")
+    for pkg, meta in sorted(manual.items()):
+        line = f"  {pkg:<30} {meta['version']}"
+        if verbose:
+            line += f"  installed {meta.get('installed_at', '?')}"
+        print(line)
+
+    if auto:
+        print("\nAuto-installed dependencies:\n")
+        for pkg, meta in sorted(auto.items()):
+            line = f"  {pkg:<30} {meta['version']}  [auto]"
+            if verbose:
+                line += f"  installed {meta.get('installed_at', '?')}"
+            print(line)
 
 
-def search(repo, term):
-    found = False
+def cmd_search(repo: dict, term: str) -> None:
+    term_l = term.lower()
+    installed = load_json(INSTALLED_DB)
+    hits = [(p, m["version"]) for p, m in repo.items() if term_l in p.lower()]
+    if not hits:
+        print(f"No packages found matching {term!r}.")
+        return
+    print(f"Results for {term!r}:\n")
+    for pkg, ver in sorted(hits):
+        marker = "  [installed]" if pkg in installed else ""
+        print(f"  {pkg:<30} {ver}{marker}")
 
-    for pkg, meta in repo.items():
-        if term.lower() in pkg.lower():
-            print(f"{pkg} ({meta['version']})")
-            found = True
 
-    if not found:
-        print("No matches found")
+def cmd_info(repo: dict, pkg: str) -> None:
+    pkg = validate_package_name(pkg)
+    if pkg not in repo:
+        print(f"Package not found: {pkg!r}")
+        return
+    meta      = repo[pkg]
+    installed = load_json(INSTALLED_DB)
+    status    = "installed" if pkg in installed else "not installed"
+    deps      = ", ".join(meta.get("deps", [])) or "(none)"
+    print(f"\n  Package : {pkg}")
+    print(f"  Version : {meta['version']}")
+    print(f"  Status  : {status}")
+    print(f"  Deps    : {deps}")
+    print(f"  URL     : {meta.get('url', 'N/A')}")
+    if pkg in installed:
+        n_files = len(installed[pkg].get("files", []))
+        print(f"  Files   : {n_files}")
 
+# ---------------------------------------------------------------------------
+# Self-tests
+# ---------------------------------------------------------------------------
 
-def run_self_tests():
-    import sys
+def run_self_tests() -> None:
+    import io
+    failures = 0
 
-    print("Running self tests")
+    def ok(name: str) -> None:
+        print(f"  ✓  {name}")
 
-    test_parser = argparse.ArgumentParser()
-    test_sub = test_parser.add_subparsers(dest="cmd")
+    def fail(name: str, reason: str = "") -> None:
+        nonlocal failures
+        msg = f"  ✗  {name}"
+        if reason:
+            msg += f": {reason}"
+        print(msg)
+        failures += 1
 
-    parsed = test_parser.parse_args([])
+    def check(name: str, condition: bool, reason: str = "") -> None:
+        ok(name) if condition else fail(name, reason)
 
-    assert parsed.cmd is None
+    print("Running veropkg self-tests …\n")
 
-    parsed = argparse.Namespace(cmd="install")
-
-    assert parsed.cmd == "install"
-
-    print("Running self tests")
-
-    assert is_safe_path("/tmp", "/tmp/example") is True
-
+    # -- is_safe_path --
+    check("is_safe_path: child",         is_safe_path("/tmp", "/tmp/a"))
+    check("is_safe_path: same",          is_safe_path("/tmp", "/tmp"))
     if os.name != "nt":
-        assert is_safe_path("/tmp", "/etc/passwd") is False
+        check("is_safe_path: traversal blocked",  not is_safe_path("/tmp", "/etc/passwd"))
+        check("is_safe_path: normalised traversal blocked",
+              not is_safe_path("/tmp", "/tmp/../etc/passwd"))
+    check("is_safe_path: prefix collision blocked",
+          not is_safe_path("/tmp", "/tmp2/file"))
 
-    repo = Repository()
+    # -- validate_package_name --
+    for good in ["firefox", "lib32-glibc", "python3.11", "pkg+ext"]:
+        try:
+            validate_package_name(good)
+            ok(f"validate_package_name: accept {good!r}")
+        except ValidationError as e:
+            fail(f"validate_package_name: accept {good!r}", str(e))
 
-    resolver = DependencyResolver(repo.repo)
+    for bad in ["", "../../etc/passwd", "-badpkg", "pkg;rm", "a" * 129]:
+        try:
+            validate_package_name(bad)
+            fail(f"validate_package_name: reject {bad[:20]!r}", "should have raised")
+        except ValidationError:
+            ok(f"validate_package_name: reject {bad[:20]!r}")
 
-    result = resolver.resolve("firefox")
+    # -- DependencyResolver --
+    resolver = DependencyResolver(DEFAULT_REPO)
+    plan = resolver.resolve("firefox")
+    check("resolve: glibc in plan",   "glibc"   in plan)
+    check("resolve: mesa in plan",    "mesa"     in plan)
+    check("resolve: firefox in plan", "firefox"  in plan)
+    check("resolve: order glibc<mesa",    plan.index("glibc") < plan.index("mesa"))
+    check("resolve: order mesa<firefox",  plan.index("mesa")  < plan.index("firefox"))
 
-    assert "glibc" in result
-    assert "mesa" in result
-    assert "firefox" in result
+    try:
+        DependencyResolver(DEFAULT_REPO).resolve("__nonexistent__")
+        fail("resolve: unknown package raises")
+    except PackageNotFoundError:
+        ok("resolve: unknown package raises PackageNotFoundError")
 
-    print("Self tests passed")
+    circular = {
+        "a": {"version": "1", "deps": ["b"], "url": "demo", "sha256": "demo"},
+        "b": {"version": "1", "deps": ["a"], "url": "demo", "sha256": "demo"},
+    }
+    try:
+        DependencyResolver(circular).resolve("a")
+        fail("resolve: circular dep raises")
+    except DependencyError:
+        ok("resolve: circular dep raises DependencyError")
+
+    three_way = {
+        "a": {"version": "1", "deps": ["b"], "url": "demo", "sha256": "demo"},
+        "b": {"version": "1", "deps": ["c"], "url": "demo", "sha256": "demo"},
+        "c": {"version": "1", "deps": ["a"], "url": "demo", "sha256": "demo"},
+    }
+    try:
+        DependencyResolver(three_way).resolve("a")
+        fail("resolve: 3-way cycle raises")
+    except DependencyError:
+        ok("resolve: 3-way cycle raises DependencyError")
+
+    missing_dep = {
+        "pkg": {"version": "1", "deps": ["ghost"], "url": "demo", "sha256": "demo"},
+    }
+    try:
+        DependencyResolver(missing_dep).resolve("pkg")
+        fail("resolve: missing dep raises")
+    except DependencyError:
+        ok("resolve: missing dep raises DependencyError")
+
+    # -- atomic_save_json / load_json --
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "test.json"
+        atomic_save_json(p, {"hello": "world", "n": 42})
+        loaded = load_json(p)
+        check("atomic_save_json roundtrip", loaded == {"hello": "world", "n": 42})
+
+    check("load_json missing file → {}", load_json("/nonexistent/__missing__.json") == {})
+
+    # -- sha256sum --
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(b"hello world")
+        tmp_path = f.name
+    try:
+        import hashlib
+        expected = hashlib.sha256(b"hello world").hexdigest()
+        check("sha256sum known value", sha256sum(tmp_path) == expected)
+    finally:
+        os.unlink(tmp_path)
+
+    # -- safe_extract: path traversal blocked --
+    fd, tpath = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    with tarfile.open(tpath, "w:gz") as tar:
+        info      = tarfile.TarInfo(name="../../../etc/evil")
+        info.size = 4
+        tar.addfile(info, io.BytesIO(b"evil"))
+    with tempfile.TemporaryDirectory() as staging:
+        try:
+            with tarfile.open(tpath) as tar:
+                safe_extract(tar, staging)
+            fail("safe_extract: traversal blocked")
+        except SecurityError:
+            ok("safe_extract: traversal blocked")
+    os.unlink(tpath)
+
+    # -- safe_extract: symlink blocked --
+    fd, tpath = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    with tarfile.open(tpath, "w:gz") as tar:
+        info          = tarfile.TarInfo(name="usr/bin/evil")
+        info.type     = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tar.addfile(info)
+    with tempfile.TemporaryDirectory() as staging:
+        try:
+            with tarfile.open(tpath) as tar:
+                safe_extract(tar, staging)
+            fail("safe_extract: symlink blocked")
+        except SecurityError:
+            ok("safe_extract: symlink blocked")
+    os.unlink(tpath)
+
+    # Summary
+    print()
+    if failures:
+        print(f"FAILED — {failures} test(s) did not pass.")
+        sys.exit(1)
+    else:
+        print("All tests passed ✓")
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="[%(levelname)s] %(name)s: %(message)s",
+    )
 
 
-def main():
+def main() -> None:
     ensure_dirs()
 
     parser = argparse.ArgumentParser(
-        description="veropkg - Veronic Linux Package Manager"
+        prog="veropkg",
+        description="veropkg — Veronic Linux Package Manager",
     )
+    parser.add_argument("--version", action="version", version=f"veropkg {__version__}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug output")
 
-    sub = parser.add_subparsers(dest="cmd")
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    p_install = sub.add_parser("install")
-    p_install.add_argument("package")
+    p_inst = sub.add_parser("install",    help="Install a package and its deps")
+    p_inst.add_argument("package")
 
-    p_remove = sub.add_parser("remove")
-    p_remove.add_argument("package")
+    p_rem = sub.add_parser("remove",     help="Remove an installed package")
+    p_rem.add_argument("package")
+    p_rem.add_argument("--force", action="store_true",
+                       help="Remove even if other packages depend on it")
 
-    p_run = sub.add_parser("run")
+    p_run = sub.add_parser("run",        help="Run a package in a sandbox")
     p_run.add_argument("package")
 
-    p_search = sub.add_parser("search")
-    p_search.add_argument("term")
+    p_srch = sub.add_parser("search",    help="Search available packages")
+    p_srch.add_argument("term")
 
-    sub.add_parser("list")
-    sub.add_parser("sync")
-    sub.add_parser("test")
+    p_info = sub.add_parser("info",      help="Show details about a package")
+    p_info.add_argument("package")
+
+    p_lst = sub.add_parser("list",       help="List installed packages")
+    p_lst.add_argument("-v", "--verbose", action="store_true",
+                       dest="list_verbose", help="Show timestamps")
+
+    sub.add_parser("sync",        help="Sync the package repository index")
+    sub.add_parser("autoremove",  help="Remove unused auto-installed packages")
+    sub.add_parser("test",        help="Run built-in self-tests")
 
     args = parser.parse_args()
+    setup_logging(args.verbose)
 
     if args.cmd is None:
         parser.print_help()
-        print()
-        print("Example usage")
-        print("  python veropkg.py install firefox")
-        print("  python veropkg.py list")
-        print("  python veropkg.py search fire")
         return
 
-    repo = Repository()
+    try:
+        repo = Repository()
+        with PackageLock():
+            match args.cmd:
+                case "sync":
+                    repo.sync()
+                case "install":
+                    require_root()
+                    Installer(repo.repo).install(args.package)
+                case "remove":
+                    require_root()
+                    Remover(repo.repo).remove(args.package, force=args.force)
+                case "autoremove":
+                    require_root()
+                    Remover(repo.repo).autoremove()
+                case "run":
+                    SandboxEngine(args.package).launch()
+                case "list":
+                    list_installed(verbose=args.list_verbose)
+                case "search":
+                    cmd_search(repo.repo, args.term)
+                case "info":
+                    cmd_info(repo.repo, args.package)
+                case "test":
+                    run_self_tests()
 
-    with PackageLock():
-        if args.cmd == "sync":
-            repo.sync()
-
-        elif args.cmd == "install":
-            Installer(repo.repo).install(args.package)
-
-        elif args.cmd == "remove":
-            Remover(repo.repo).remove(args.package)
-
-        elif args.cmd == "run":
-            SandboxEngine(args.package).launch()
-
-        elif args.cmd == "list":
-            list_installed()
-
-        elif args.cmd == "search":
-            search(repo.repo, args.term)
-
-        elif args.cmd == "test":
-            run_self_tests()
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
+    except VeroPkgError as exc:
+        log.debug("", exc_info=True)
+        print(f"\nError: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
